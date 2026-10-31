@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include <limits.h>
 #include <string.h>
 
 #include "fmgr.h"
@@ -22,54 +23,59 @@ fuzzy_corrupt(const char *detail)
              errdetail("%s", detail)));
 }
 
-void
-fuzzy_target_payload_view(const FuzzyTargetPayload *payload, Size payload_len,
-                          FuzzyTargetView *view)
+static void
+validate_beginnings(const int32 *beginnings, Size blen, uint32 target_len)
+{
+    int32 previous = -1;
+
+    for (Size i = 0; i < blen; i++)
+    {
+        int32 value = beginnings[i];
+        if (value < 0 || (uint32) value >= target_len || value < previous)
+            fuzzy_corrupt("invalid beginning offset");
+        previous = value;
+    }
+}
+
+static void
+view_from_v1(const FuzzyTargetPayload *payload, Size payload_len,
+             FuzzyTargetView *view)
 {
     if (payload_len < sizeof(FuzzyTargetPayload))
-        fuzzy_corrupt("payload is too short");
-
-    if (payload->magic != FUZZY_TARGET_MAGIC)
-        fuzzy_corrupt("bad magic");
-    if (payload->format_version != FUZZY_TARGET_FORMAT_VERSION)
-        fuzzy_corrupt("unsupported format version");
+        fuzzy_corrupt("v1 payload is too short");
+    if (payload->format_version != FUZZY_TARGET_FORMAT_VERSION_V1)
+        fuzzy_corrupt("unsupported v1 format version");
     if ((payload->flags & ~FUZZY_TARGET_FLAG_HAS_SPACE) != 0)
-        fuzzy_corrupt("unknown flags");
+        fuzzy_corrupt("unknown v1 flags");
     if (payload->target_len < 0 || payload->beginnings_len < 0)
-        fuzzy_corrupt("negative length");
+        fuzzy_corrupt("negative v1 length");
 
     Size base = sizeof(FuzzyTargetPayload);
     Size blen = (Size) payload->beginnings_len;
     Size tlen = (Size) payload->target_len;
 
     if (blen > (MaxAllocSize - base) / sizeof(int32))
-        fuzzy_corrupt("beginnings length overflows");
+        fuzzy_corrupt("v1 beginnings length overflows");
     Size after_beginnings = base + blen * sizeof(int32);
     if (tlen > (MaxAllocSize - after_beginnings) / sizeof(uint16))
-        fuzzy_corrupt("target length overflows");
+        fuzzy_corrupt("v1 target length overflows");
     Size expected = after_beginnings + tlen * sizeof(uint16);
     if (expected != payload_len)
-        fuzzy_corrupt("payload length does not match header");
+        fuzzy_corrupt("v1 payload length does not match header");
 
     const int32 *beginnings =
         (const int32 *) ((const char *) payload + base);
-    int32 previous = -1;
-    for (Size i = 0; i < blen; i++)
-    {
-        int32 value = beginnings[i];
-        if (value < 0 || value >= payload->target_len || value < previous)
-            fuzzy_corrupt("invalid beginning offset");
-        previous = value;
-    }
-
+    validate_beginnings(beginnings, blen, (uint32) payload->target_len);
     for (int i = 0; i < 26; i++)
     {
         int32 value = payload->first_table[i];
         if (value < 0 || value > payload->target_len)
-            fuzzy_corrupt("invalid first-letter table");
+            fuzzy_corrupt("invalid v1 first-letter table");
     }
 
     view->len = payload->target_len;
+    view->ascii = false;
+    view->ascii_codes = NULL;
     view->codes = (const uint16_t *) ((const char *) payload + after_beginnings);
     view->bitflags = payload->bitflags;
     view->has_space = (payload->flags & FUZZY_TARGET_FLAG_HAS_SPACE) != 0;
@@ -78,50 +84,124 @@ fuzzy_target_payload_view(const FuzzyTargetPayload *payload, Size payload_len,
     view->first_table = payload->first_table;
 }
 
-FuzzyTargetPayload *
+static void
+view_from_v2(const FuzzyTargetPayloadV2 *payload, Size payload_len,
+             FuzzyTargetView *view)
+{
+    if (payload_len < sizeof(FuzzyTargetPayloadV2))
+        fuzzy_corrupt("v2 payload is too short");
+    if (payload->format_version != FUZZY_TARGET_FORMAT_VERSION)
+        fuzzy_corrupt("unsupported v2 format version");
+    if ((payload->flags &
+         ~(FUZZY_TARGET_FLAG_HAS_SPACE | FUZZY_TARGET_FLAG_ASCII)) != 0)
+        fuzzy_corrupt("unknown v2 flags");
+    if (payload->target_len > (uint32) INT_MAX ||
+        payload->beginnings_len > (uint32) INT_MAX)
+        fuzzy_corrupt("v2 length is too large");
+
+    Size base = sizeof(FuzzyTargetPayloadV2);
+    Size blen = (Size) payload->beginnings_len;
+    Size tlen = (Size) payload->target_len;
+    bool ascii = (payload->flags & FUZZY_TARGET_FLAG_ASCII) != 0;
+
+    if (blen > (MaxAllocSize - base) / sizeof(int32))
+        fuzzy_corrupt("v2 beginnings length overflows");
+    Size after_beginnings = base + blen * sizeof(int32);
+    Size code_bytes = ascii ? tlen : tlen * sizeof(uint16);
+    if (code_bytes > MaxAllocSize - after_beginnings)
+        fuzzy_corrupt("v2 target length overflows");
+    Size expected = after_beginnings + code_bytes;
+    if (expected != payload_len)
+        fuzzy_corrupt("v2 payload length does not match header");
+
+    const int32 *beginnings =
+        (const int32 *) ((const char *) payload + base);
+    validate_beginnings(beginnings, blen, payload->target_len);
+    const char *codes = (const char *) payload + after_beginnings;
+
+    view->len = (int) payload->target_len;
+    view->ascii = ascii;
+    view->ascii_codes = ascii ? (const uint8_t *) codes : NULL;
+    view->codes = ascii ? NULL : (const uint16_t *) codes;
+    view->bitflags = payload->bitflags;
+    view->has_space = (payload->flags & FUZZY_TARGET_FLAG_HAS_SPACE) != 0;
+    view->beginnings_len = (int) payload->beginnings_len;
+    view->beginnings = (const int *) beginnings;
+    view->first_table = NULL;
+}
+
+void
+fuzzy_target_payload_view(const FuzzyTargetPayload *payload, Size payload_len,
+                          FuzzyTargetView *view)
+{
+    if (payload_len < 8)
+        fuzzy_corrupt("payload is too short");
+    if (payload->magic != FUZZY_TARGET_MAGIC)
+        fuzzy_corrupt("bad magic");
+
+    uint32 version_field;
+    memcpy(&version_field, (const char *) payload + 4, sizeof(uint32));
+
+    if (version_field == FUZZY_TARGET_FORMAT_VERSION_V1 ||
+        payload->format_version == FUZZY_TARGET_FORMAT_VERSION_V1)
+        view_from_v1(payload, payload_len, view);
+    else
+        view_from_v2((const FuzzyTargetPayloadV2 *) payload, payload_len, view);
+}
+
+void *
 fuzzy_target_payload_create(const FuzzyTargetView *view, Size *payload_len)
 {
     if (view->len < 0 || view->beginnings_len < 0)
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("pg_fuzzysearch: invalid prepared target")));
+    if (view->ascii && view->len > 0 && view->ascii_codes == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_fuzzysearch: invalid ASCII prepared target")));
+    if (!view->ascii && view->len > 0 && view->codes == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("pg_fuzzysearch: invalid UTF-16 prepared target")));
 
-    Size base = sizeof(FuzzyTargetPayload);
+    Size base = sizeof(FuzzyTargetPayloadV2);
     Size blen = (Size) view->beginnings_len;
     Size tlen = (Size) view->len;
+    bool ascii = view->ascii;
 
     if (blen > (MaxAllocSize - base) / sizeof(int32))
         ereport(ERROR,
                 (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                  errmsg("pg_fuzzysearch: prepared target is too large")));
     Size after_beginnings = base + blen * sizeof(int32);
-    if (tlen > (MaxAllocSize - after_beginnings) / sizeof(uint16))
+    Size code_bytes = ascii ? tlen : tlen * sizeof(uint16);
+    if (code_bytes > MaxAllocSize - after_beginnings)
         ereport(ERROR,
                 (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                  errmsg("pg_fuzzysearch: prepared target is too large")));
-    Size total = after_beginnings + tlen * sizeof(uint16);
+    Size total = after_beginnings + code_bytes;
 
-    FuzzyTargetPayload *payload = palloc0(total);
+    FuzzyTargetPayloadV2 *payload = palloc0(total);
     payload->magic = FUZZY_TARGET_MAGIC;
     payload->format_version = FUZZY_TARGET_FORMAT_VERSION;
+    payload->flags = (view->has_space ? FUZZY_TARGET_FLAG_HAS_SPACE : 0) |
+                     (ascii ? FUZZY_TARGET_FLAG_ASCII : 0);
     payload->bitflags = view->bitflags;
-    payload->flags = view->has_space ? FUZZY_TARGET_FLAG_HAS_SPACE : 0;
-    payload->target_len = view->len;
-    payload->beginnings_len = view->beginnings_len;
+    payload->target_len = (uint32) view->len;
+    payload->beginnings_len = (uint32) view->beginnings_len;
 
-    if (view->first_table != NULL)
-        memcpy(payload->first_table, view->first_table,
-               26 * sizeof(int32));
-
-    int32 *beginnings =
-        (int32 *) ((char *) payload + base);
+    int32 *beginnings = (int32 *) ((char *) payload + base);
     for (Size i = 0; i < blen; i++)
         beginnings[i] = view->beginnings[i];
 
-    uint16_t *codes =
-        (uint16_t *) ((char *) beginnings + blen * sizeof(int32));
-    if (tlen > 0)
-        memcpy(codes, view->codes, tlen * sizeof(uint16_t));
+    char *codes = (char *) beginnings + blen * sizeof(int32);
+    if (tlen > 0) {
+        if (ascii)
+            memcpy(codes, view->ascii_codes, tlen);
+        else
+            memcpy(codes, view->codes, tlen * sizeof(uint16_t));
+    }
 
     *payload_len = total;
     return payload;
@@ -308,7 +388,7 @@ pg_fuzzy_prepare(PG_FUNCTION_ARGS)
     text       *value = PG_GETARG_TEXT_PP(0);
     FuzzyTarget *target;
     const FuzzyTargetView *view;
-    FuzzyTargetPayload *payload;
+    void       *payload;
     Size        payload_len;
     struct varlena *result;
 

@@ -25,6 +25,7 @@ struct FuzzyQuery {
 
 struct FuzzyTarget {
     uint16_t *codes;
+    uint8_t *ascii_codes;
     int *beginnings;
     int first_table[26];
     FuzzyTargetView view;
@@ -320,15 +321,40 @@ FuzzyTarget *fuzzy_target_prepare(const char *input, size_t len)
 
     FuzzySearch search;
     prepare_search_from_lower(lower, lower_len, &search);
-    target->codes = search.codes;
     if (!fuzzy_beginnings(units, lower, lower_len, &target->beginnings,
                           &target->view.beginnings_len, target->first_table)) {
         free(units);
+        free(lower);
         fuzzy_target_free(target);
         return NULL;
     }
 
+    bool ascii = true;
+    for (size_t i = 0; i < lower_len; i++) {
+        if (lower[i] > 0x7f) {
+            ascii = false;
+            break;
+        }
+    }
+
+    if (ascii) {
+        target->ascii_codes = malloc(lower_len > 0 ? lower_len : 1);
+        if (target->ascii_codes == NULL) {
+            free(units);
+            free(lower);
+            fuzzy_target_free(target);
+            return NULL;
+        }
+        for (size_t i = 0; i < lower_len; i++)
+            target->ascii_codes[i] = (uint8_t) lower[i];
+        free(lower);
+    } else {
+        target->codes = lower;
+    }
+
     target->view.len = search.len;
+    target->view.ascii = ascii;
+    target->view.ascii_codes = target->ascii_codes;
     target->view.codes = target->codes;
     target->view.bitflags = search.bitflags;
     target->view.has_space = search.has_space;
@@ -355,6 +381,7 @@ void fuzzy_target_free(FuzzyTarget *target)
     if (target == NULL)
         return;
     free(target->codes);
+    free(target->ascii_codes);
     free(target->beginnings);
     free(target);
 }
@@ -364,16 +391,30 @@ const FuzzyTargetView *fuzzy_target_view(const FuzzyTarget *target)
     return target != NULL ? &target->view : NULL;
 }
 
-static bool is_subsequence(const uint16_t *needle, int nlen,
-                           const uint16_t *hay, int hlen)
+static inline uint16_t target_code(const FuzzyTargetView *target, int index)
+{
+    return target->ascii ? (uint16_t) target->ascii_codes[index]
+                         : target->codes[index];
+}
+
+static bool is_subsequence_view(const uint16_t *needle, int nlen,
+                                const FuzzyTargetView *target)
 {
     int j = 0;
 
     if (nlen <= 0)
         return false;
-    for (int i = 0; i < hlen && j < nlen; i++) {
-        if (hay[i] == needle[j])
-            j++;
+
+    if (target->ascii) {
+        for (int i = 0; i < target->len && j < nlen; i++) {
+            if (target->ascii_codes[i] == needle[j])
+                j++;
+        }
+    } else {
+        for (int i = 0; i < target->len && j < nlen; i++) {
+            if (target->codes[i] == needle[j])
+                j++;
+        }
     }
     return j == nlen;
 }
@@ -390,8 +431,7 @@ bool fuzzy_match_bool_view(const FuzzyQuery *query,
         if ((query->full.bitflags & target->bitflags) !=
             query->full.bitflags)
             return false;
-        return is_subsequence(query->full.codes, query->full.len,
-                              target->codes, target->len);
+        return is_subsequence_view(query->full.codes, query->full.len, target);
     }
 
     if (query->nparts == 0)
@@ -401,8 +441,7 @@ bool fuzzy_match_bool_view(const FuzzyQuery *query,
 
         if ((part->bitflags & target->bitflags) != part->bitflags)
             return false;
-        if (!is_subsequence(part->codes, part->len,
-                            target->codes, target->len))
+        if (!is_subsequence_view(part->codes, part->len, target))
             return false;
     }
     return true;
@@ -411,6 +450,45 @@ bool fuzzy_match_bool_view(const FuzzyQuery *query,
 bool fuzzy_match_bool(const FuzzyQuery *query, const FuzzyTarget *target)
 {
     return fuzzy_match_bool_view(query, fuzzy_target_view(target));
+}
+
+int fuzzy_match_ascii_bytes(const FuzzyQuery *query, const char *data, size_t len)
+{
+    const uint16_t *needle;
+    int nlen;
+    int matched = 0;
+    bool complete = false;
+
+    if (query->empty)
+        return 1;
+    if (query->full.has_space)
+        return -1;
+
+    needle = query->full.codes;
+    nlen = query->full.len;
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char) data[i];
+
+        if (c >= 0x80)
+            return -1;
+        if (complete)
+            continue;
+
+        if (c == '"' || c == '`')
+            c = '\'';
+        else if (c == '\\')
+            c = '/';
+        else if (c >= 'A' && c <= 'Z')
+            c = (unsigned char) (c + ('a' - 'A'));
+
+        if ((uint16_t) c == needle[matched]) {
+            if (++matched == nlen)
+                complete = true;
+        }
+    }
+
+    return complete ? 1 : 0;
 }
 
 static int find_sub(const uint16_t *hay, int hlen,
@@ -424,6 +502,28 @@ static int find_sub(const uint16_t *hay, int hlen,
     for (int i = from; i <= hlen - nlen; i++) {
         if (hay[i] == needle[0] &&
             memcmp(hay + i, needle, (size_t) nlen * sizeof(uint16_t)) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int find_sub_view(const FuzzyTargetView *target,
+                         const uint16_t *needle, int nlen, int from)
+{
+    if (!target->ascii)
+        return find_sub(target->codes, target->len, needle, nlen, from);
+
+    if (nlen <= 0 || from < 0 || from > target->len - nlen)
+        return -1;
+
+    for (int i = from; i <= target->len - nlen; i++) {
+        int j = 0;
+        for (; j < nlen; j++) {
+            uint16_t want = needle[j];
+            if (want > 0x7f || target->ascii_codes[i + j] != (uint8_t) want)
+                break;
+        }
+        if (j == nlen)
             return i;
     }
     return -1;
@@ -522,7 +622,6 @@ static bool algorithm2(const FuzzySearch *search, const FuzzyTargetView *target,
                        const int *beginnings, int start, int end,
                        double cutoff, FuzzyScratch *s, AlgResult *out)
 {
-    const uint16_t *target_codes = target->codes;
     int target_len = target->len;
     const uint16_t *search_codes = search->codes;
     int search_len = search->len;
@@ -535,18 +634,18 @@ static bool algorithm2(const FuzzySearch *search, const FuzzyTargetView *target,
     first_code = search_codes[0];
     second_code = search_codes[1];
 
-    while (target_codes[first] != first_code) {
-        if (++first >= target_len)
-            return false;
-    }
+    if (cutoff != -FUZZY_INF && score_ceiling(2, target_len) < cutoff)
+        return false;
+
+    while (first < target_len && target_code(target, first) != first_code)
+        first++;
+    if (first >= target_len)
+        return false;
 
     second = first + 1;
-    while (target_codes[second] != second_code) {
-        if (++second >= target_len)
-            return false;
-    }
-
-    if (cutoff != -FUZZY_INF && score_ceiling(2, target_len) <= cutoff)
+    while (second < target_len && target_code(target, second) != second_code)
+        second++;
+    if (second >= target_len)
         return false;
 
     if (beginnings == NULL) {
@@ -555,7 +654,7 @@ static bool algorithm2(const FuzzySearch *search, const FuzzyTargetView *target,
         end = target->beginnings_len;
     }
 
-    int substring_i = find_sub(target_codes, target_len, search_codes, 2, first);
+    int substring_i = find_sub_view(target, search_codes, 2, first);
     bool substring = substring_i != -1;
     int low = lower_bound(beginnings, start, end, substring_i);
     bool substring_start = substring && low < end &&
@@ -571,14 +670,14 @@ static bool algorithm2(const FuzzySearch *search, const FuzzyTargetView *target,
         for (int backtracks = 0; first_beginning < end;) {
             int strict_first = beginnings[first_beginning];
 
-            if (target_codes[strict_first] != first_code) {
+            if (target_code(target, strict_first) != first_code) {
                 first_beginning++;
                 continue;
             }
 
             int consecutive = strict_first + 1;
             if (consecutive < target_len &&
-                target_codes[consecutive] == second_code) {
+                target_code(target, consecutive) == second_code) {
                 first = strict_first;
                 second = consecutive;
                 strict = true;
@@ -590,7 +689,7 @@ static bool algorithm2(const FuzzySearch *search, const FuzzyTargetView *target,
                    beginnings[second_beginning] <= consecutive)
                 second_beginning++;
             while (second_beginning < end &&
-                   target_codes[beginnings[second_beginning]] != second_code)
+                   target_code(target, beginnings[second_beginning]) != second_code)
                 second_beginning++;
 
             if (second_beginning < end) {
@@ -612,8 +711,8 @@ static bool algorithm2(const FuzzySearch *search, const FuzzyTargetView *target,
         for (; low < end; low++) {
             int index = beginnings[low];
             if (index + 1 < target_len &&
-                target_codes[index] == first_code &&
-                target_codes[index + 1] == second_code) {
+                target_code(target, index) == first_code &&
+                target_code(target, index + 1) == second_code) {
                 substring_i = index;
                 substring_start = true;
                 break;
@@ -661,7 +760,6 @@ static bool algorithm2(const FuzzySearch *search, const FuzzyTargetView *target,
 static bool algorithm_spaces(const FuzzyQuery *query, const FuzzyTargetView *target,
                              bool partial, FuzzyScratch *s, AlgResult *out)
 {
-    const uint16_t *target_codes = target->codes;
     int target_len = target->len;
     double score = 0;
     int previous_first = 0;
@@ -748,7 +846,6 @@ static bool algorithm_spaces(const FuzzyQuery *query, const FuzzyTargetView *tar
     out->score = score;
     out->indexes = s->seen;
     out->len = seen_len;
-    (void) target_codes;
     return true;
 }
 
@@ -759,7 +856,6 @@ static bool algorithm(const FuzzySearch *search, const FuzzyTargetView *target,
                       FuzzyScratch *s, AlgResult *out)
 {
     const uint16_t *search_codes = search->codes;
-    const uint16_t *target_codes = target->codes;
     int search_len = search->len;
     int target_len = target->len;
     int search_i = 0;
@@ -772,6 +868,10 @@ static bool algorithm(const FuzzySearch *search, const FuzzyTargetView *target,
     if (search_len <= 0 || target_len <= 0)
         return false;
 
+    if (cutoff != -FUZZY_INF && search_len > 1 &&
+        score_ceiling(search_len, target_len) < cutoff)
+        return false;
+
     if (beginnings == NULL && next == NULL) {
         build_next(target, s->next);
         next = s->next;
@@ -779,19 +879,16 @@ static bool algorithm(const FuzzySearch *search, const FuzzyTargetView *target,
 
     search_code = search_codes[0];
     for (;;) {
-        if (search_code == target_codes[target_i]) {
+        if (target_i >= target_len)
+            return false;
+        if (search_code == target_code(target, target_i)) {
             s->simple[search_i] = target_i;
             if (++search_i == search_len)
                 break;
             search_code = search_codes[search_i];
         }
-        if (++target_i >= target_len)
-            return false;
+        target_i++;
     }
-
-    if (cutoff != -FUZZY_INF && search_len > 1 &&
-        score_ceiling(search_len, target_len) <= cutoff)
-        return false;
 
     if (search_len == 1 && !changed && single_match) {
         int match_i = s->simple[0];
@@ -799,7 +896,7 @@ static bool algorithm(const FuzzySearch *search, const FuzzyTargetView *target,
 
         for (int b = 0; b < target->beginnings_len; b++) {
             int idx = target->beginnings[b];
-            if (target_codes[idx] == search_code) {
+            if (target_code(target, idx) == search_code) {
                 match_i = idx;
                 strict = true;
                 break;
@@ -837,8 +934,7 @@ static bool algorithm(const FuzzySearch *search, const FuzzyTargetView *target,
     }
 
     int substring_i = search_len <= 1 ? -1 :
-        find_sub(target_codes, target_len, search_codes, search_len,
-                 s->simple[0]);
+        find_sub_view(target, search_codes, search_len, s->simple[0]);
     bool is_substring = substring_i != -1;
     bool substring_start = is_substring &&
         (substring_i == 0 ||
@@ -865,7 +961,7 @@ static bool algorithm(const FuzzySearch *search, const FuzzyTargetView *target,
                         ? next_beginning(beginnings, start, end,
                                          previous, target_len)
                         : next[previous];
-                } else if (search_codes[search_i] == target_codes[target_i]) {
+                } else if (search_codes[search_i] == target_code(target, target_i)) {
                     s->strict[strict_len++] = target_i;
                     if (++search_i == search_len) {
                         strict = true;
@@ -891,7 +987,7 @@ static bool algorithm(const FuzzySearch *search, const FuzzyTargetView *target,
                 int j = 0;
                 for (; j < search_len; j++) {
                     if (i + j >= target_len ||
-                        search_codes[j] != target_codes[i + j])
+                        search_codes[j] != target_code(target, i + j))
                         break;
                 }
                 if (j == search_len) {
@@ -907,7 +1003,7 @@ static bool algorithm(const FuzzySearch *search, const FuzzyTargetView *target,
                 int j = 0;
                 for (; j < search_len; j++) {
                     if (i + j >= target_len ||
-                        search_codes[j] != target_codes[i + j])
+                        search_codes[j] != target_code(target, i + j))
                         break;
                 }
                 if (j == search_len) {
@@ -1033,6 +1129,69 @@ bool fuzzy_score(const FuzzyQuery *query, const FuzzyTarget *target,
     return fuzzy_score_view(query, fuzzy_target_view(target), scratch, result);
 }
 
+static double denormalize_score(double value)
+{
+    if (value == 0)
+        return -FUZZY_INF;
+    if (value > 1)
+        return value;
+    return 1 - pow(log(value) / -2 + 1, 1 / .04307);
+}
+
+bool fuzzy_match_threshold_view(const FuzzyQuery *query,
+                                const FuzzyTargetView *target,
+                                double min_score, FuzzyScratch *scratch)
+{
+    AlgResult alg;
+    bool matched;
+
+    if (query->empty)
+        return min_score <= 0;
+
+    if (min_score <= 0)
+        return fuzzy_match_bool_view(query, target);
+    if (min_score > 1)
+        return false;
+    if (scratch == NULL)
+        return false;
+    scratch->oom = false;
+
+    if (query->full.has_space) {
+        FuzzyResult result;
+
+        matched = fuzzy_score_view(query, target, scratch, &result);
+        if (!matched)
+            return false;
+        return result.score >= min_score;
+    }
+
+    if (!fuzzy_scratch_reserve(scratch, query->full.len, query->nparts,
+                               target->len)) {
+        scratch->oom = true;
+        return false;
+    }
+
+    double cutoff = denormalize_score(min_score);
+    if (query->full.len == 2)
+        matched = algorithm2(&query->full, target, target->beginnings, 0,
+                             target->beginnings_len, cutoff, scratch, &alg);
+    else
+        matched = algorithm(&query->full, target, false, false, false, true,
+                            target->beginnings, 0, target->beginnings_len,
+                            NULL, cutoff, scratch, &alg);
+
+    if (!matched)
+        return false;
+    return normalize_score(alg.score) >= min_score;
+}
+
+bool fuzzy_match_threshold(const FuzzyQuery *query, const FuzzyTarget *target,
+                           double min_score, FuzzyScratch *scratch)
+{
+    return fuzzy_match_threshold_view(query, fuzzy_target_view(target),
+                                      min_score, scratch);
+}
+
 char *fuzzy_debug_query_normalize(const char *input, size_t len, size_t *out_len)
 {
     FuzzyQuery *query = fuzzy_query_prepare(input, len);
@@ -1061,8 +1220,21 @@ char *fuzzy_debug_target_normalize(const char *input, size_t len, size_t *out_le
 
     if (target == NULL)
         return NULL;
-    result = fuzzy_utf16_to_utf8(target->codes,
-                                 (size_t) target->view.len, out_len);
+    if (target->view.ascii) {
+        size_t n = (size_t) target->view.len;
+        uint16_t *copy = malloc((n > 0 ? n : 1) * sizeof(uint16_t));
+        if (copy == NULL) {
+            fuzzy_target_free(target);
+            return NULL;
+        }
+        for (size_t i = 0; i < n; i++)
+            copy[i] = target->view.ascii_codes[i];
+        result = fuzzy_utf16_to_utf8(copy, n, out_len);
+        free(copy);
+    } else {
+        result = fuzzy_utf16_to_utf8(target->codes,
+                                     (size_t) target->view.len, out_len);
+    }
     fuzzy_target_free(target);
     return result;
 }

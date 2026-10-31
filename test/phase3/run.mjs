@@ -185,6 +185,11 @@ add('tab\tquery', 'tab query')
 add('line\nquery', 'line query')
 add('˚', 'team')
 add('˚t', 'team')
+add('a', 'a'.repeat(60000))
+add('aaaa', 'a'.repeat(60000))
+add('xxxx', 'a'.repeat(60000))
+add('aaaa bbb', 'a'.repeat(60000) + 'bbb')
+add('zzzzzzzzzzzzzzzz', 'a '.repeat(20000))
 
 const randomTargets = Array.from({length: 800}, () => randomString(80))
 for(let i = 0; i < 800; i++) {
@@ -220,6 +225,42 @@ for(let i = 0; i < 200; i++) {
 // ---------------------------------------------------------------------------
 function csvField(value) {
   return '"' + value.replace(/"/g, '""') + '"'
+}
+
+/*
+ * Build a version-1 fuzzy_target payload for an ASCII target.  Version 1 is
+ * the layout written by the Phase 3 build; keeping a fixture here prevents
+ * accidental breakage for values prepared before the compact v2 format.
+ */
+function v1PayloadHex(target) {
+  const codes = [...target].map(c => c.charCodeAt(0))
+  const beginnings = [0]
+  const firstTable = new Array(26).fill(0)
+  let bitflags = 0
+  for(let i = 0; i < target.length; i++) {
+    const c = target.charCodeAt(i)
+    if(c === 32) bitflags |= 1 << 27
+    else if(c >= 97 && c <= 122) bitflags |= 1 << (c - 97)
+    else if(c >= 48 && c <= 57) bitflags |= 1 << 26
+    else if(c <= 127) bitflags |= 1 << 30
+    else bitflags |= 1 << 31
+  }
+  if(codes.length > 0 && codes[0] >= 97 && codes[0] <= 122)
+    firstTable[codes[0] - 97] = 1
+
+  const header = 128
+  const payload = Buffer.alloc(header + 4 * beginnings.length + 2 * codes.length)
+  payload.writeUInt32LE(0x465A5431, 0)
+  payload.writeUInt32LE(1, 4)
+  payload.writeUInt32LE(bitflags >>> 0, 8)
+  payload.writeUInt32LE(0, 12)
+  payload.writeInt32LE(codes.length, 16)
+  payload.writeInt32LE(beginnings.length, 20)
+  for(let i = 0; i < 26; i++) payload.writeInt32LE(firstTable[i], 24 + i * 4)
+  let offset = header
+  for(const value of beginnings) { payload.writeInt32LE(value, offset); offset += 4 }
+  for(const value of codes) { payload.writeUInt16LE(value, offset); offset += 2 }
+  return 'FX1:' + payload.toString('hex')
 }
 function csvLine(fields) {
   return fields.map(field => field === null ? '' : csvField(String(field))).join(',')
@@ -329,6 +370,14 @@ function checkPreparedCases(file) {
 }
 
 function checkTypeAndIo() {
+  const v1 = v1PayloadHex('abc')
+  const v1Result = psql(['-Atc', `
+    SELECT fuzzy_score('abc', '${v1}'::fuzzy_target) = 1,
+           fuzzy_match('abc', '${v1}'::fuzzy_target);
+  `])
+  if(v1Result.stdout.trim() !== 't|t')
+    fail('version 1 prepared payload is not readable', v1Result.stdout)
+
   const typeProps = psql(['-Atc', `
     SELECT typlen = -1 AND typstorage = 'x' AND typalign = 'i'
     FROM pg_type WHERE oid = 'fuzzy_target'::regtype;

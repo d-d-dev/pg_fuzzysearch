@@ -3,9 +3,9 @@
 A PostgreSQL port of the search/matching core of
 [fuzzysort](https://github.com/farzher/fuzzysort) 4.0.2.
 
-**Current status:** Phase 3 is complete. The pure C core, raw `text`
-functions, and the prepared `fuzzy_target` type are implemented and verified
-against the JavaScript reference. Phase 4 focuses on performance hardening. See
+**Current status:** Phase 4 is complete. The extension now has raw `text`
+functions, prepared `fuzzy_target` values, ASCII fast paths, threshold pruning,
+and parallel-scan benchmarks. Phase 5 is optional/release work. See
 [PLAN.md](PLAN.md).
 
 ## What works today
@@ -17,19 +17,22 @@ against the JavaScript reference. Phase 4 focuses on performance hardening. See
 - Raw `text` SQL functions, query caching, and UTF-8 enforcement.
 - Prepared `fuzzy_target` values, text/binary I/O, generated columns, and
   raw-vs-prepared parity.
-- Differential test harnesses for the C core, SQL layer, and prepared targets.
+- Compact ASCII prepared storage with version-1 compatibility.
+- Allocation-free ASCII prefilter for raw searches.
+- Threshold score-ceiling pruning and parallel-safe scans.
+- Differential test harnesses for the C core, SQL layer, prepared targets, and
+  integration behavior.
 
-Phase 3 prepared-target result:
+Phase 4 benchmark summary:
 
-```
-prepared target cases: 2729
-prepared cases: 2729/2729 passed
-type I/O and API: passed
-binary COPY round-trip: passed
-generated prepared column: passed
-0.1.0 -> 0.2.0 upgrade: passed
-PHASE 3 PREPARED-TARGET TESTS PASSED
-```
+- Prepared storage: UE4 64 B vs 23 B raw; Steam 81 B vs 27 B raw.
+- Prepared vs raw at threshold .5: up to 2.1x faster on common letter queries,
+  3.8x on the 1M `item` query, and 1.7x on long descriptions.
+- Prepared 1M synthetic `render` threshold .5: ~103 ms warm single-core;
+  parallel 4 workers ~74 ms, 8 workers ~64 ms.
+- Threshold `.8` prunes the 1M scan down to ~83 ms.
+- Selective queries such as `rtrgt` can be faster on raw `text` because the
+  allocation-free ASCII prefilter avoids reading prepared values.
 
 ## Build and test
 
@@ -42,8 +45,10 @@ make test-phase1     # core parity against fuzzysort
 make pg              # PostgreSQL extension shared library
 make test-phase2     # temporary PG17 cluster + raw SQL parity tests
 make test-phase3     # prepared-target correctness tests
+make test-phase4     # parallel/long-input integration tests
 make bench-phase3    # raw vs prepared UE4/Steam benchmark
-make test            # all parity suites
+make bench-phase4    # threshold/parallel/1M benchmark
+make test            # all parity and integration suites
 ```
 
 The test harnesses load the reference implementation from `../fuzzysort`,
@@ -65,6 +70,8 @@ test/phase1/run.mjs   core differential harness
 test/phase2/run.mjs   SQL differential harness
 test/phase3/run.mjs   prepared-target tests
 test/phase3/bench.mjs raw vs prepared benchmark
+test/phase4/run.mjs   parallel/long-input integration tests
+test/phase4/bench.mjs full benchmark suite
 PLAN.md               phased implementation plan
 ```
 

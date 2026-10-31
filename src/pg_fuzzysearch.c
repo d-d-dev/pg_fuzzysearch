@@ -178,7 +178,8 @@ pg_fuzzy_match(PG_FUNCTION_ARGS)
 {
     FuzzyCache *cache;
     FuzzyQuery *query;
-    FuzzyTarget *target;
+    FuzzyTarget *target = NULL;
+    text       *target_text = PG_GETARG_TEXT_PP(1);
     bool        matched;
 
     fuzzy_require_utf8();
@@ -187,27 +188,49 @@ pg_fuzzy_match(PG_FUNCTION_ARGS)
 
     if (PG_NARGS() == 2)
     {
-        target = fuzzy_get_target(PG_GETARG_TEXT_PP(1));
-        matched = fuzzy_match_bool(query, target);
+        int         early = fuzzy_match_ascii_bytes(query,
+                                                    VARDATA_ANY(target_text),
+                                                    (size_t) VARSIZE_ANY_EXHDR(target_text));
+
+        if (early >= 0)
+            matched = early == 1;
+        else
+        {
+            target = fuzzy_get_target(target_text);
+            matched = fuzzy_match_bool(query, target);
+            fuzzy_target_free(target);
+            target = NULL;
+        }
     }
     else
     {
         FuzzyScratch *scratch = fuzzy_get_scratch(cache);
-        FuzzyResult result;
         double      min_score = PG_GETARG_FLOAT8(2);
+        int         early;
 
         if (isnan(min_score))
             ereport(ERROR,
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                      errmsg("pg_fuzzysearch: min_score must not be NaN")));
 
-        target = fuzzy_get_target(PG_GETARG_TEXT_PP(1));
-        matched = fuzzy_score(query, target, scratch, &result);
-        fuzzy_check_scratch(scratch, target);
-        matched = matched && result.score >= min_score;
+        early = fuzzy_match_ascii_bytes(query, VARDATA_ANY(target_text),
+                                        (size_t) VARSIZE_ANY_EXHDR(target_text));
+        if (early == 0)
+            matched = false;
+        else if (early == 1 && min_score <= 0)
+            matched = true;
+        else if (min_score > 1)
+            matched = false;
+        else
+        {
+            target = fuzzy_get_target(target_text);
+            matched = fuzzy_match_threshold(query, target, min_score, scratch);
+            fuzzy_check_scratch(scratch, target);
+            fuzzy_target_free(target);
+            target = NULL;
+        }
     }
 
-    fuzzy_target_free(target);
     PG_RETURN_BOOL(matched);
 }
 
@@ -220,12 +243,19 @@ pg_fuzzy_score(PG_FUNCTION_ARGS)
     FuzzyScratch *scratch;
     FuzzyResult result;
     bool        matched;
+    text       *target_text = PG_GETARG_TEXT_PP(1);
+    int         early;
 
     fuzzy_require_utf8();
     cache = fuzzy_get_cache(fcinfo);
     query = fuzzy_get_query(cache, PG_GETARG_TEXT_PP(0));
+    early = fuzzy_match_ascii_bytes(query, VARDATA_ANY(target_text),
+                                    (size_t) VARSIZE_ANY_EXHDR(target_text));
+    if (early == 0)
+        PG_RETURN_NULL();
+
     scratch = fuzzy_get_scratch(cache);
-    target = fuzzy_get_target(PG_GETARG_TEXT_PP(1));
+    target = fuzzy_get_target(target_text);
 
     matched = fuzzy_score(query, target, scratch, &result);
     fuzzy_check_scratch(scratch, target);
@@ -257,7 +287,6 @@ pg_fuzzy_match_prepared(PG_FUNCTION_ARGS)
     else
     {
         FuzzyScratch *scratch = fuzzy_get_scratch(cache);
-        FuzzyResult result;
         double      min_score = PG_GETARG_FLOAT8(2);
 
         if (isnan(min_score))
@@ -265,9 +294,8 @@ pg_fuzzy_match_prepared(PG_FUNCTION_ARGS)
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                      errmsg("pg_fuzzysearch: min_score must not be NaN")));
 
-        matched = fuzzy_score_view(query, &target, scratch, &result);
+        matched = fuzzy_match_threshold_view(query, &target, min_score, scratch);
         fuzzy_check_scratch(scratch, NULL);
-        matched = matched && result.score >= min_score;
     }
 
     PG_RETURN_BOOL(matched);

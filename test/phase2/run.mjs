@@ -200,6 +200,11 @@ add('line\nquery', 'line query')
 add('˚', 'team')
 add('˚t', 'team')
 add('˚tt', 'team')
+add('a', 'a'.repeat(60000))
+add('aaaa', 'a'.repeat(60000))
+add('xxxx', 'a'.repeat(60000))
+add('aaaa bbb', 'a'.repeat(60000) + 'bbb')
+add('zzzzzzzzzzzzzzzz', 'a '.repeat(20000))
 
 const randomTargets = Array.from({length: 1200}, () => randomString(80))
 for(let i = 0; i < 1200; i++) {
@@ -322,7 +327,11 @@ function checkScoreCases(file) {
       SELECT c.*,
              fuzzy_match(query, target) AS actual_match,
              fuzzy_score(query, target) AS actual_score,
+             fuzzy_match(query, target, 0.1) AS t01,
+             fuzzy_match(query, target, 0.3) AS t03,
              fuzzy_match(query, target, 0.5) AS actual_threshold,
+             fuzzy_match(query, target, 0.8) AS t08,
+             fuzzy_match(query, target, 1.0) AS t10,
              fuzzy_normalize_query(query) AS actual_norm_query,
              fuzzy_normalize(target) AS actual_norm_target
       FROM score_cases c
@@ -333,37 +342,51 @@ function checkScoreCases(file) {
       count(*) FILTER (WHERE
         (expected_score IS NULL) <> (actual_score IS NULL)
         OR (expected_score IS NOT NULL AND abs(actual_score - expected_score) > 1e-12)),
+      count(*) FILTER (WHERE
+        t01 IS DISTINCT FROM (expected_score IS NOT NULL AND expected_score >= 0.1)
+        OR t03 IS DISTINCT FROM (expected_score IS NOT NULL AND expected_score >= 0.3)
+        OR t08 IS DISTINCT FROM (expected_score IS NOT NULL AND expected_score >= 0.8)
+        OR t10 IS DISTINCT FROM (expected_score IS NOT NULL AND expected_score >= 1.0)),
       count(*) FILTER (WHERE actual_norm_query IS DISTINCT FROM expected_norm_query),
       count(*) FILTER (WHERE actual_norm_target IS DISTINCT FROM expected_norm_target),
       count(*)
     FROM actual;
   `])
-  const [badMatch, badThreshold, badScore, badNq, badNt, total] =
+  const [badMatch, badThreshold, badScore, badMoreThresholds, badNq, badNt, total] =
     result.stdout.trim().split('|').map(Number)
-  console.log(`score cases: ${total - Math.max(badMatch, badThreshold, badScore, badNq, badNt)}/${total} passed`)
-  if(badMatch || badThreshold || badScore || badNq || badNt) {
+  console.log(`score cases: ${total - Math.max(badMatch, badThreshold, badMoreThresholds, badScore, badNq, badNt)}/${total} passed`)
+  if(badMatch || badThreshold || badMoreThresholds || badScore || badNq || badNt) {
     const bad = psql(['-Atc', `
       WITH actual AS MATERIALIZED (
         SELECT c.*,
                fuzzy_match(query, target) AS actual_match,
                fuzzy_score(query, target) AS actual_score,
+               fuzzy_match(query, target, 0.1) AS t01,
+               fuzzy_match(query, target, 0.3) AS t03,
                fuzzy_match(query, target, 0.5) AS actual_threshold,
+               fuzzy_match(query, target, 0.8) AS t08,
+               fuzzy_match(query, target, 1.0) AS t10,
                fuzzy_normalize_query(query) AS actual_norm_query,
                fuzzy_normalize(target) AS actual_norm_target
         FROM score_cases c
       )
-      SELECT query, target, expected_match, actual_match, expected_score, actual_score,
-             expected_threshold, actual_threshold
+      SELECT query, left(target, 120), expected_match, actual_match, expected_score,
+             actual_score, expected_threshold, actual_threshold,
+             t01, t03, t08, t10
       FROM actual
       WHERE actual_match IS DISTINCT FROM expected_match
          OR actual_threshold IS DISTINCT FROM expected_threshold
+         OR t01 IS DISTINCT FROM (expected_score IS NOT NULL AND expected_score >= 0.1)
+         OR t03 IS DISTINCT FROM (expected_score IS NOT NULL AND expected_score >= 0.3)
+         OR t08 IS DISTINCT FROM (expected_score IS NOT NULL AND expected_score >= 0.8)
+         OR t10 IS DISTINCT FROM (expected_score IS NOT NULL AND expected_score >= 1.0)
          OR (expected_score IS NULL) <> (actual_score IS NULL)
          OR (expected_score IS NOT NULL AND abs(actual_score - expected_score) > 1e-12)
          OR actual_norm_query IS DISTINCT FROM expected_norm_query
          OR actual_norm_target IS DISTINCT FROM expected_norm_target
       LIMIT 20;
     `])
-    fail(`score-case mismatches: match=${badMatch}, threshold=${badThreshold}, score=${badScore}, norm_query=${badNq}, norm_target=${badNt}`,
+    fail(`score-case mismatches: match=${badMatch}, threshold=${badThreshold}, more_thresholds=${badMoreThresholds}, score=${badScore}, norm_query=${badNq}, norm_target=${badNt}`,
          bad.stdout)
   }
 }

@@ -8,7 +8,7 @@ BUILD := build
 CORE_OBJS := $(BUILD)/fuzzy_core.o $(BUILD)/normalize.o $(BUILD)/tables.o
 CLI := $(BUILD)/fuzzy_cli
 
-.PHONY: all clean test test-phase1 test-phase2 test-phase3 bench-phase3 tables pg pg-install install
+.PHONY: all clean test test-phase1 test-phase2 test-phase3 test-phase4 bench-phase3 bench-phase4 tables pg pg-install install
 
 all: $(CLI)
 
@@ -38,10 +38,16 @@ test-phase2: $(CLI) pg
 test-phase3: $(CLI) pg
 	node test/phase3/run.mjs
 
+test-phase4: $(CLI) pg
+	node test/phase4/run.mjs
+
 bench-phase3: $(CLI) pg
 	node test/phase3/bench.mjs
 
-test: test-phase1 test-phase2 test-phase3
+bench-phase4: $(CLI) pg
+	node test/phase4/bench.mjs
+
+test: test-phase1 test-phase2 test-phase3 test-phase4
 
 pg:
 	$(MAKE) -C pg

@@ -17,6 +17,8 @@ typedef struct FuzzyScratch FuzzyScratch;
  */
 typedef struct FuzzyTargetView {
     int len;
+    bool ascii;
+    const uint8_t *ascii_codes;
     const uint16_t *codes;
     uint32_t bitflags;
     bool has_space;
@@ -60,7 +62,19 @@ bool fuzzy_score(const FuzzyQuery *query, const FuzzyTarget *target,
 bool fuzzy_score_view(const FuzzyQuery *query, const FuzzyTargetView *target,
                       FuzzyScratch *scratch, FuzzyResult *result);
 
+/* Thresholded match without materializing a score; uses score-ceiling pruning
+ * for non-space queries. */
+bool fuzzy_match_threshold(const FuzzyQuery *query, const FuzzyTarget *target,
+                           double min_score, FuzzyScratch *scratch);
+bool fuzzy_match_threshold_view(const FuzzyQuery *query,
+                                const FuzzyTargetView *target,
+                                double min_score, FuzzyScratch *scratch);
+
 const FuzzyTargetView *fuzzy_target_view(const FuzzyTarget *target);
+
+/* Fast raw-UTF-8 prefilter for ASCII targets and non-space queries.
+ * Returns 1 = match, 0 = no match, -1 = fall back to full preparation. */
+int fuzzy_match_ascii_bytes(const FuzzyQuery *query, const char *data, size_t len);
 
 /* Debug/parity helpers.  Returned strings are malloc'd UTF-8. */
 char *fuzzy_debug_query_normalize(const char *input, size_t len, size_t *out_len);
