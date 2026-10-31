@@ -1,6 +1,6 @@
 # pg_fuzzysearch_dsf41 — Implementation Plan
 
-**Status:** Phase 2 complete. Phases 3–5 remain.
+**Status:** Phase 3 complete. Phases 4–5 remain.
 **Target:** PostgreSQL 17, UTF-8 databases only.
 **Reference implementation:** `fuzzysort` 4.0.2, commit `ac4d42ec894a2125d78802ec9b5e74e43518d0fc` (the clone in `../fuzzysort`).
 **Project root:** `pg_fuzzysearch_dsf41/`
@@ -67,6 +67,7 @@ pg_fuzzysearch_dsf41/
 │   ├── fuzzy_core.c/.h      pure C matcher and scorer
 │   ├── normalize.c/.h       UTF-8/UTF-16, remap, lowercase, bitflags, beginnings
 │   ├── tables.c/.h          generated static Unicode tables
+│   ├── fuzzy_type.c/.h      prepared fuzzy_target varlena type (Phase 3)
 │   └── pg_fuzzysearch.c     PostgreSQL C glue (Phase 2)
 ├── tools/
 │   ├── gen_tables.mjs       regenerates src/tables.c/.h
@@ -75,19 +76,18 @@ pg_fuzzysearch_dsf41/
 │   ├── Makefile             PGXS build
 │   └── pg_fuzzysearch.control
 ├── sql/
-│   └── pg_fuzzysearch--0.1.0.sql
+│   ├── pg_fuzzysearch--0.1.0.sql
+│   ├── pg_fuzzysearch--0.1.0--0.2.0.sql
+│   └── pg_fuzzysearch--0.2.0.sql
 └── test/
     ├── phase1/run.mjs       core differential parity harness
-    └── phase2/run.mjs       temporary-cluster SQL parity harness
+    ├── phase2/run.mjs       temporary-cluster SQL parity harness
+    └── phase3/
+        ├── run.mjs          prepared-target correctness tests
+        └── bench.mjs        raw vs prepared benchmark
 ```
 
-Phase 3 will add:
-
-```
-src/fuzzy_type.c           prepared target varlena type
-sql/pg_fuzzysearch--0.2.0.sql
-test/phase3/                raw-vs-prepared and type I/O tests
-```
+Phase 4 will add ASCII target representation and benchmark tooling.
 
 ---
 
@@ -314,24 +314,23 @@ suite and prepared-target comparison.
 
 ---
 
-## 5. Phase 3 — Prepared target type
+## 5. Phase 3 — Prepared target type (COMPLETE)
 
 ### Objective
 
 Remove repeated target normalization and beginning construction, which is the
 largest per-row cost for ranked searches.
 
-### Prepared type
+### Prepared type (implemented)
 
-Add a varlena type, tentatively `fuzzy_target`:
+Added the varlena type `fuzzy_target`:
 
 ```c
-fuzzy_target:
-  header: magic/format version, bitflags, has_space, ascii flag,
-          target_len (UTF-16 code units), beginnings_len
-  first_begin[26]
-  beginnings[]        uint32 offsets
-  lower[]             uint8 ASCII or uint16 UTF-16
+FuzzyTargetPayload:
+  magic, format_version, bitflags, flags, target_len, beginnings_len
+  first_table[26]
+  beginnings[]        int32 offsets
+  codes[]             uint16 UTF-16 code units
 ```
 
 - `fuzzy_prepare(target text) RETURNS fuzzy_target`.
@@ -339,11 +338,11 @@ fuzzy_target:
   - `fuzzy_match(query text, target fuzzy_target [, min_score])`
   - `fuzzy_score(query text, target fuzzy_target)`
 - Type I/O:
-  - text output for display;
-  - binary send/recv for COPY;
-  - version/magic validation on input;
-  - document that normalization-version upgrades require re-preparing stored
-    values.
+  - text output/input uses an `FX1:<hex>` form;
+  - binary send/recv carries the payload for COPY;
+  - magic/version/length/offset validation rejects corrupt values;
+  - normalization-version upgrades require re-preparing stored values.
+- Extension version is now `0.2.0`; `0.1.0 -- 0.2.0` upgrade script exists.
 - Recommended usage:
 
 ```sql
@@ -355,27 +354,77 @@ Generated columns are recomputed on dump/restore and avoid stale prepared data.
 
 ### Query cache integration
 
-The raw-text query cache was implemented in Phase 2. Phase 3 extends it to the
-prepared-target overloads:
-
-- reuse the same `fn_extra` cache and per-query scratch buffers;
-- validate cached query bytes for generic plans;
-- never cache per-row raw targets.
+The raw-text query cache was implemented in Phase 2. The prepared-target
+overloads reuse the same `fn_extra` cache and scratch buffers. Cached query bytes
+are compared on every call, so generic plans with changing parameters are safe.
+Per-row raw targets are never cached.
 
 ### Testing
 
-- Raw vs prepared score/index equality over the Phase 1 corpus.
-- Generated column and plain prepared column tests.
-- COPY/dump/restore and corrupted-type validation.
-- Prepared statements with changing query parameters.
-- Storage/TOAST measurements: prepared value size vs raw text.
-- Benchmark raw `text` vs prepared column on 13k/183k rows.
+- 2,729 raw/prepared cases from fuzzysort datasets, curated cases, and random
+  inputs: match/score equality, prepared threshold behavior, and text I/O
+  round-trips.
+- Generated-column insert/update tests.
+- Text output/input and binary COPY round-trips, including Unicode and empty
+  targets.
+- Corrupt `FX1:` payload and invalid input syntax rejection.
+- `0.1.0 -> 0.2.0` upgrade script test.
+- Raw-vs-prepared benchmark on UE4 and Steam.
 
-### Exit criteria
+### Phase 3 results
 
-- Identical results for raw and prepared inputs.
-- Prepared scan measurably faster than raw input for ranked searches.
-- Type I/O is safe and dump/restore works.
+`make test-phase3`:
+
+```
+prepared target cases: 2729
+prepared cases: 2729/2729 passed
+type I/O and API: passed
+binary COPY round-trip: passed
+generated prepared column: passed
+0.1.0 -> 0.2.0 upgrade: passed
+PHASE 3 PREPARED-TARGET TESTS PASSED
+```
+
+`make bench-phase3` (PostgreSQL 17.11, single core, warm cache, median of 3):
+
+Relation sizes:
+
+```
+ue4   13,164 rows   3,632 kB   title avg 23.1 B    prepared avg 197.1 B
+steam 182,964 rows  49 MB      title avg 26.5 B    prepared avg 214.3 B
+```
+
+Match-only, threshold 0.5:
+
+| table | query | raw ms | prepared ms | speedup |
+|---|---|---|---|---|
+| ue4 | e | 5.49 | 3.54 | 1.55x |
+| ue4 | el | 5.40 | 4.08 | 1.32x |
+| ue4 | eld | 5.58 | 3.78 | 1.48x |
+| ue4 | render | 5.26 | 3.33 | 1.58x |
+| ue4 | rtrgt | 6.08 | 3.17 | 1.92x |
+| steam | e | 39.94 | 22.23 | 1.80x |
+| steam | el | 39.46 | 23.01 | 1.71x |
+| steam | eld | 41.87 | 23.42 | 1.79x |
+| steam | render | 38.01 | 22.60 | 1.68x |
+
+Ordered top-10 was 1.4x–1.8x faster with prepared targets.
+
+### Phase 3 known limitations
+
+- Prepared values are UTF-16 only; average storage is roughly 8x the raw title
+  for the tested datasets. Phase 4 will add an ASCII representation.
+- `first_table` is stored but not yet used by a dedicated single-character
+  algorithm.
+- The current prepared representation does not define equality operators; tests
+  compare output/input and scores instead.
+
+### Phase 3 exit criteria — met
+
+- Identical results for raw and prepared inputs — met.
+- Prepared scan is measurably faster — 1.3x–1.9x on the benchmark.
+- Type I/O and binary COPY are safe — met.
+- Upgrade script works — met.
 
 ---
 
@@ -543,8 +592,8 @@ Because PostgreSQL does the sorting:
 |---|---|---|
 | Phase 1 — pure C core + fuzzysort parity | **Complete** | 257,820/257,820 score cases passed; normalization/beginnings 100% |
 | Phase 2 — PG17 extension shell + raw SQL functions | **Complete** | SQL API, query cache, 7,442 score cases, 63,487 normalization cases, non-UTF-8 rejection |
-| Phase 3 — prepared target type + overloads | Not started | Next |
-| Phase 4 — performance hardening + benchmarks | Not started | |
+| Phase 3 — prepared target type + overloads | **Complete** | `fuzzy_target`, type I/O, generated columns, upgrade script, 2,729 prepared cases, 1.3x–1.9x speedup |
+| Phase 4 — performance hardening + benchmarks | Not started | Next |
 | Phase 5 — optional indexes/multi-key/release | Not started | |
 
 ---
@@ -558,6 +607,8 @@ make                 # build the standalone C core + parity CLI
 make test-phase1     # run the fuzzysort differential harness
 make pg              # build the PostgreSQL extension (.so)
 make test-phase2     # start a temp PG17 cluster and run SQL parity tests
+make test-phase3     # prepared target correctness tests
+make bench-phase3    # raw-vs-prepared UE4/Steam benchmark
 make pg-install      # install the extension (requires write access to PG dirs)
 make tables          # regenerate src/tables.c/.h from Node
 make clean

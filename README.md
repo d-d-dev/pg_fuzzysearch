@@ -3,9 +3,10 @@
 A PostgreSQL port of the search/matching core of
 [fuzzysort](https://github.com/farzher/fuzzysort) 4.0.2.
 
-**Current status:** Phase 2 is complete. The pure C core and the raw `text`
-PostgreSQL functions are implemented and verified against the JavaScript
-reference. Prepared targets are Phase 3. See [PLAN.md](PLAN.md).
+**Current status:** Phase 3 is complete. The pure C core, raw `text`
+functions, and the prepared `fuzzy_target` type are implemented and verified
+against the JavaScript reference. Phase 4 focuses on performance hardening. See
+[PLAN.md](PLAN.md).
 
 ## What works today
 
@@ -14,16 +15,20 @@ reference. Prepared targets are Phase 3. See [PLAN.md](PLAN.md).
 - Boolean subsequence matching, including multi-word queries.
 - Exact fuzzysort scores and match indexes.
 - Raw `text` SQL functions, query caching, and UTF-8 enforcement.
-- Differential test harnesses for both the C core and the SQL layer.
+- Prepared `fuzzy_target` values, text/binary I/O, generated columns, and
+  raw-vs-prepared parity.
+- Differential test harnesses for the C core, SQL layer, and prepared targets.
 
-Phase 2 SQL result:
+Phase 3 prepared-target result:
 
 ```
-basic SQL API: passed
-score cases: 7442/7442 passed
-normalization cases: 63487/63487 passed
-non-UTF-8 rejection: passed
-PHASE 2 SQL PARITY PASSED
+prepared target cases: 2729
+prepared cases: 2729/2729 passed
+type I/O and API: passed
+binary COPY round-trip: passed
+generated prepared column: passed
+0.1.0 -> 0.2.0 upgrade: passed
+PHASE 3 PREPARED-TARGET TESTS PASSED
 ```
 
 ## Build and test
@@ -35,8 +40,10 @@ the reference harnesses and table generation).
 make                 # standalone C core + parity CLI
 make test-phase1     # core parity against fuzzysort
 make pg              # PostgreSQL extension shared library
-make test-phase2     # temporary PG17 cluster + SQL parity tests
-make test            # both parity suites
+make test-phase2     # temporary PG17 cluster + raw SQL parity tests
+make test-phase3     # prepared-target correctness tests
+make bench-phase3    # raw vs prepared UE4/Steam benchmark
+make test            # all parity suites
 ```
 
 The test harnesses load the reference implementation from `../fuzzysort`,
@@ -48,19 +55,22 @@ which is the clone already present in this workspace.
 src/fuzzy_core.c/.h   pure C matcher/scorer
 src/normalize.c/.h    UTF-8/UTF-16 and fuzzysort normalization
 src/tables.c/.h       generated Unicode tables
+src/fuzzy_type.c/.h   prepared fuzzy_target varlena type
 src/pg_fuzzysearch.c  PostgreSQL C glue
 tools/gen_tables.mjs  table generator
 tools/fuzzy_cli.c     standalone parity CLI
 pg/                   PGXS build + control file
-sql/                  extension SQL script
+sql/                  0.1.0, 0.2.0, and upgrade SQL
 test/phase1/run.mjs   core differential harness
 test/phase2/run.mjs   SQL differential harness
+test/phase3/run.mjs   prepared-target tests
+test/phase3/bench.mjs raw vs prepared benchmark
 PLAN.md               phased implementation plan
 ```
 
 ## SQL API
 
-Phase 2 exposes raw `text` functions:
+The extension exposes raw `text` functions:
 
 ```sql
 fuzzy_match(query text, target text) RETURNS boolean
@@ -70,12 +80,24 @@ fuzzy_normalize(value text) RETURNS text
 fuzzy_normalize_query(value text) RETURNS text
 ```
 
+Prepared targets are available in version 0.2.0:
+
+```sql
+fuzzy_prepare(target text) RETURNS fuzzy_target
+fuzzy_match(query text, target fuzzy_target) RETURNS boolean
+fuzzy_match(query text, target fuzzy_target, min_score double precision) RETURNS boolean
+fuzzy_score(query text, target fuzzy_target) RETURNS double precision
+```
+
 Example:
 
 ```sql
+ALTER TABLE items ADD COLUMN title_fuzzy fuzzy_target
+  GENERATED ALWAYS AS (fuzzy_prepare(title)) STORED;
+
 SELECT id, title, s.score
 FROM items, LATERAL (
-  SELECT fuzzy_score('rtrgt', items.title) AS score
+  SELECT fuzzy_score('rtrgt', items.title_fuzzy) AS score
 ) s
 WHERE s.score >= 0.5
 ORDER BY s.score DESC NULLS LAST, id
@@ -84,13 +106,6 @@ LIMIT 10;
 
 `fuzzy_match(q, t, 0.5)` applies the usual fuzzysort quality threshold.
 `fuzzy_score` returns `NULL` for no match and `0` for an empty query.
-
-Phase 3 will add a prepared target type and generated-column support:
-
-```sql
-ALTER TABLE items ADD COLUMN title_fuzzy fuzzy_target
-  GENERATED ALWAYS AS (fuzzy_prepare(title)) STORED;
-```
 
 ## Design notes
 

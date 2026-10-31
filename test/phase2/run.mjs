@@ -290,7 +290,7 @@ function generateNormalizationCases() {
 // SQL setup and checks
 // ---------------------------------------------------------------------------
 function loadFunctions() {
-  const sql = readFileSync(resolve(projectRoot, 'sql/pg_fuzzysearch--0.1.0.sql'), 'utf8')
+  const sql = readFileSync(resolve(projectRoot, 'sql/pg_fuzzysearch--0.2.0.sql'), 'utf8')
     .replaceAll('MODULE_PATHNAME', resolve(projectRoot, 'pg/pg_fuzzysearch.so'))
     .split('\n')
     .filter(line => !line.startsWith('\\echo'))
@@ -476,7 +476,7 @@ function checkNonUtf8Rejected() {
     '-v', 'ON_ERROR_STOP=1', '-c',
     "CREATE DATABASE fuzzy_latin1 ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0;",
   ])
-  const sql = readFileSync(resolve(projectRoot, 'sql/pg_fuzzysearch--0.1.0.sql'), 'utf8')
+  const sql = readFileSync(resolve(projectRoot, 'sql/pg_fuzzysearch--0.2.0.sql'), 'utf8')
     .replaceAll('MODULE_PATHNAME', resolve(projectRoot, 'pg/pg_fuzzysearch.so'))
     .split('\n')
     .filter(line => !line.startsWith('\\echo'))

@@ -10,6 +10,7 @@
 #include "varatt.h"
 
 #include "fuzzy_core.h"
+#include "fuzzy_type.h"
 
 PG_MODULE_MAGIC;
 
@@ -130,6 +131,16 @@ fuzzy_get_target(text *target_text)
 }
 
 static void
+fuzzy_get_prepared_view(FunctionCallInfo fcinfo, int argno,
+                        FuzzyTargetView *view)
+{
+    struct varlena *value = PG_GETARG_VARLENA_P(argno);
+
+    fuzzy_target_payload_view((const FuzzyTargetPayload *) VARDATA(value),
+                              VARSIZE(value) - VARHDRSZ, view);
+}
+
+static void
 fuzzy_check_scratch(FuzzyScratch *scratch, FuzzyTarget *target)
 {
     if (fuzzy_scratch_oom(scratch))
@@ -157,6 +168,8 @@ fuzzy_get_scratch(FuzzyCache *cache)
 
 PG_FUNCTION_INFO_V1(pg_fuzzy_match);
 PG_FUNCTION_INFO_V1(pg_fuzzy_score);
+PG_FUNCTION_INFO_V1(pg_fuzzy_match_prepared);
+PG_FUNCTION_INFO_V1(pg_fuzzy_score_prepared);
 PG_FUNCTION_INFO_V1(pg_fuzzy_normalize);
 PG_FUNCTION_INFO_V1(pg_fuzzy_normalize_query);
 
@@ -217,6 +230,67 @@ pg_fuzzy_score(PG_FUNCTION_ARGS)
     matched = fuzzy_score(query, target, scratch, &result);
     fuzzy_check_scratch(scratch, target);
     fuzzy_target_free(target);
+
+    if (!matched)
+        PG_RETURN_NULL();
+
+    PG_RETURN_FLOAT8(result.score);
+}
+
+Datum
+pg_fuzzy_match_prepared(PG_FUNCTION_ARGS)
+{
+    FuzzyCache *cache;
+    FuzzyQuery *query;
+    FuzzyTargetView target;
+    bool        matched;
+
+    fuzzy_require_utf8();
+    cache = fuzzy_get_cache(fcinfo);
+    query = fuzzy_get_query(cache, PG_GETARG_TEXT_PP(0));
+    fuzzy_get_prepared_view(fcinfo, 1, &target);
+
+    if (PG_NARGS() == 2)
+    {
+        matched = fuzzy_match_bool_view(query, &target);
+    }
+    else
+    {
+        FuzzyScratch *scratch = fuzzy_get_scratch(cache);
+        FuzzyResult result;
+        double      min_score = PG_GETARG_FLOAT8(2);
+
+        if (isnan(min_score))
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("pg_fuzzysearch: min_score must not be NaN")));
+
+        matched = fuzzy_score_view(query, &target, scratch, &result);
+        fuzzy_check_scratch(scratch, NULL);
+        matched = matched && result.score >= min_score;
+    }
+
+    PG_RETURN_BOOL(matched);
+}
+
+Datum
+pg_fuzzy_score_prepared(PG_FUNCTION_ARGS)
+{
+    FuzzyCache *cache;
+    FuzzyQuery *query;
+    FuzzyTargetView target;
+    FuzzyScratch *scratch;
+    FuzzyResult result;
+    bool        matched;
+
+    fuzzy_require_utf8();
+    cache = fuzzy_get_cache(fcinfo);
+    query = fuzzy_get_query(cache, PG_GETARG_TEXT_PP(0));
+    fuzzy_get_prepared_view(fcinfo, 1, &target);
+    scratch = fuzzy_get_scratch(cache);
+
+    matched = fuzzy_score_view(query, &target, scratch, &result);
+    fuzzy_check_scratch(scratch, NULL);
 
     if (!matched)
         PG_RETURN_NULL();

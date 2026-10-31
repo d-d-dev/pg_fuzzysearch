@@ -1,7 +1,7 @@
 EXTENSION = pg_fuzzysearch
 MODULE_big = pg_fuzzysearch
-OBJS = ../src/fuzzy_core.o ../src/normalize.o ../src/tables.o ../src/pg_fuzzysearch.o
-DATA = ../sql/pg_fuzzysearch--0.1.0.sql
+OBJS = ../src/fuzzy_core.o ../src/normalize.o ../src/tables.o ../src/fuzzy_type.o ../src/pg_fuzzysearch.o
+DATA = ../sql/pg_fuzzysearch--0.1.0.sql ../sql/pg_fuzzysearch--0.2.0.sql ../sql/pg_fuzzysearch--0.1.0--0.2.0.sql
 PG_CPPFLAGS = -I../src
 SHLIB_LINK += -lm
 

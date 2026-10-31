@@ -10,6 +10,21 @@ typedef struct FuzzyTarget FuzzyTarget;
 
 typedef struct FuzzyScratch FuzzyScratch;
 
+/*
+ * A non-owning view of prepared target data.  The SQL layer can point this at
+ * a varlena payload without copying; fuzzy_target_prepare() exposes an owning
+ * FuzzyTarget as a view as well.
+ */
+typedef struct FuzzyTargetView {
+    int len;
+    const uint16_t *codes;
+    uint32_t bitflags;
+    bool has_space;
+    int beginnings_len;
+    const int *beginnings;
+    const int *first_table;   /* 26 entries, optional */
+} FuzzyTargetView;
+
 bool fuzzy_scratch_oom(const FuzzyScratch *scratch);
 
 typedef struct {
@@ -35,11 +50,17 @@ void fuzzy_scratch_free(FuzzyScratch *scratch);
 /* Fast boolean-only search.  Empty/effectively-empty queries match every
  * target, with score 0 in the scoring API. */
 bool fuzzy_match_bool(const FuzzyQuery *query, const FuzzyTarget *target);
+bool fuzzy_match_bool_view(const FuzzyQuery *query,
+                           const FuzzyTargetView *target);
 
 /* Full fuzzysort-compatible scoring.  Returns true when the query matches.
  * An empty/effectively-empty query matches with raw_score=-Inf and score=0. */
 bool fuzzy_score(const FuzzyQuery *query, const FuzzyTarget *target,
                  FuzzyScratch *scratch, FuzzyResult *result);
+bool fuzzy_score_view(const FuzzyQuery *query, const FuzzyTargetView *target,
+                      FuzzyScratch *scratch, FuzzyResult *result);
+
+const FuzzyTargetView *fuzzy_target_view(const FuzzyTarget *target);
 
 /* Debug/parity helpers.  Returned strings are malloc'd UTF-8. */
 char *fuzzy_debug_query_normalize(const char *input, size_t len, size_t *out_len);
